@@ -20,6 +20,7 @@ from sklearn.mixture import GaussianMixture
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
 from scipy.cluster.hierarchy import dendrogram, linkage
+from sklearn.preprocessing import MinMaxScaler
 import matplotlib.pyplot as plt
 import seaborn as sns
 from io import BytesIO
@@ -38,6 +39,18 @@ if 'results_history' not in st.session_state:
 if 'current_data' not in st.session_state:
     st.session_state.current_data = None
 
+
+if 'scaling_applied' not in st.session_state:
+    st.session_state.scaling_applied = False
+if 'data_preprocessed' not in st.session_state:
+    st.session_state.data_preprocessed = False
+
+if 'unscaled_data' not in st.session_state:
+    st.session_state.unscaled_data = None
+
+if 'data_before_scaling' not in st.session_state:
+    st.session_state.data_before_scaling = None
+    
 # ============================================================================
 # FONCTIONS UTILITAIRES
 # ============================================================================
@@ -194,6 +207,7 @@ if data_source == "Ensembles prédéfinis":
         with st.spinner("Chargement en cours..."):
             df = load_preset_dataset(dataset_name)
             st.session_state.current_data = df
+            st.session_state.data_before_scaling = df.copy()
             st.sidebar.success(f"✅ Dataset {dataset_name} chargé ({len(df)} lignes)")
 
 else:
@@ -217,10 +231,120 @@ else:
                 df = None
             else:
                 st.session_state.current_data = df
+                st.session_state.data_before_scaling = df.copy()
                 st.sidebar.success(f"✅ Fichier chargé ({len(df)} lignes)")
                 
         except Exception as e:
             st.sidebar.error(f"❌ Erreur de chargement: {str(e)}")
+
+# ============================================================================
+# SIDEBAR - DATA PREPROCESSING (FIXED FOR SCALING REAPPLICATION)
+# ============================================================================
+if st.session_state.current_data is not None:
+    df = st.session_state.current_data.copy()
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🧰 Prétraitement des Données")
+
+    # Check for missing values
+    has_missing, missing_cols = check_missing_values(df)
+    if has_missing:
+        st.sidebar.warning(f"⚠️ {len(missing_cols)} colonnes contiennent des valeurs manquantes.")
+        missing_action = st.sidebar.selectbox(
+            "Gérer les valeurs manquantes:",
+            ["Supprimer les lignes", "Remplir par la moyenne", "Remplir par la médiane", "Remplir par 0"]
+        )
+        if st.sidebar.button("🔧 Appliquer le traitement"):
+            if missing_action == "Supprimer les lignes":
+                df = df.dropna()
+            else:
+                numeric_cols = df.select_dtypes(include=[np.number]).columns
+                non_numeric_cols = df.columns.difference(numeric_cols)
+
+                if missing_action == "Remplir par la moyenne":
+                    df[numeric_cols] = df[numeric_cols].fillna(df[numeric_cols].mean())
+                elif missing_action == "Remplir par la médiane":
+                    df[numeric_cols] = df[numeric_cols].fillna(df[numeric_cols].median())
+                else:  # Remplir par 0
+                    df[numeric_cols] = df[numeric_cols].fillna(0)
+
+                for col in non_numeric_cols:
+                    if df[col].isnull().any():
+                        mode_val = df[col].mode()
+                        fill_val = mode_val[0] if not mode_val.empty else "missing"
+                        df[col] = df[col].fillna(fill_val)
+
+            st.session_state.current_data = df
+            st.session_state.data_before_scaling = df.copy()  # ← ADD THIS LINE
+            st.session_state.unscaled_data = None
+            st.session_state.scaling_applied = False
+            st.session_state.data_preprocessed = False
+            st.sidebar.success(f"✅ Valeurs manquantes traitées ({len(df)} lignes restantes)")
+            st.rerun()
+
+    # Categorical Encoding
+    categorical_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
+    if len(categorical_cols) > 0:
+        st.sidebar.markdown("**Encodage des variables catégorielles:**")
+        encoding_method = st.sidebar.selectbox(
+            "Choisir la méthode d'encodage:",
+            ["Aucun", "One-Hot Encoding", "Label Encoding"]
+        )
+        if encoding_method != "Aucun":
+            st.sidebar.info("⚠️ L'encodage sera appliqué sur toutes les colonnes catégorielles.")
+    else:
+        encoding_method = "Aucun"
+
+    # Feature Scaling
+    st.sidebar.markdown("**Normalisation des features:**")
+    scaling_method = st.sidebar.selectbox(
+        "Choisir la méthode de normalisation:",
+        ["Aucune", "StandardScaler (Z-score)", "MinMaxScaler"]
+    )
+
+    # Apply preprocessing (missing + encoding → store as unscaled; then scale if needed)
+    if st.sidebar.button("⚙️ Appliquer le prétraitement", type="secondary"):
+        with st.spinner("Application du prétraitement..."):
+            # Always start from clean data (after missing-value handling, before scaling/encoding)
+            if st.session_state.data_before_scaling is not None:
+                df_base = st.session_state.data_before_scaling.copy()
+            else:
+                df_base = df.copy()  # fallback
+
+            df_preprocessed = df_base.copy()
+
+            scaling_done = False
+            encoding_applied = False
+
+            # Handle encoding FIRST (affects column structure)
+            categorical_cols_base = df_base.select_dtypes(include=['object', 'category']).columns.tolist()
+            if encoding_method != "Aucun" and len(categorical_cols_base) > 0:
+                if encoding_method == "One-Hot Encoding":
+                    df_preprocessed = pd.get_dummies(df_preprocessed, columns=categorical_cols_base, drop_first=True)
+                else:  # Label Encoding
+                    from sklearn.preprocessing import LabelEncoder
+                    le = LabelEncoder()
+                    for col in categorical_cols_base:
+                        df_preprocessed[col] = le.fit_transform(df_preprocessed[col].astype(str))
+                encoding_applied = True
+                st.sidebar.success(f"✅ Variables catégorielles encodées avec {encoding_method}")
+
+            # Handle scaling on the (possibly encoded) data
+            if scaling_method != "Aucune":
+                numeric_cols = df_preprocessed.select_dtypes(include=[np.number]).columns
+                if len(numeric_cols) > 0:
+                    scaler = StandardScaler() if scaling_method == "StandardScaler (Z-score)" else MinMaxScaler()
+                    df_preprocessed[numeric_cols] = scaler.fit_transform(df_preprocessed[numeric_cols])
+                    scaling_done = True
+                    st.sidebar.success(f"✅ Features normalisées avec {scaling_method}")
+                else:
+                    st.sidebar.warning("⚠️ Aucune colonne numérique à normaliser.")
+
+            # Save final result
+            st.session_state.current_data = df_preprocessed
+            st.session_state.scaling_applied = scaling_done
+            st.session_state.data_preprocessed = True
+            st.sidebar.success("✅ Prétraitement terminé!")
+            st.rerun()
 
 # Afficher aperçu et sélection des colonnes
 if st.session_state.current_data is not None:
@@ -249,6 +373,14 @@ if st.session_state.current_data is not None:
 # SIDEBAR - PARAMÉTRAGE DES ALGORITHMES
 # ============================================================================
 
+if len(selected_features) >= 2:
+    # Show data state
+    if st.session_state.scaling_applied:
+        st.sidebar.markdown("📌 **Données** : ✅ Normalisées")
+    else:
+        st.sidebar.markdown("📌 **Données** : ⚠️ Non normalisées (seront normalisées avant clustering)")
+
+    
 if len(selected_features) >= 2:
     st.sidebar.markdown("---")
     st.sidebar.subheader("2️⃣ Configuration du clustering")
@@ -280,23 +412,19 @@ if len(selected_features) >= 2:
             ["full", "tied", "diag", "spherical"]
         )
     
-    # Bouton d'exécution
+        # Bouton d'exécution
     if st.sidebar.button("🚀 Exécuter le clustering", type="primary"):
         with st.spinner("Clustering en cours..."):
-            # Préparer les données
-            X_df = df[selected_features].copy()
-            
-            # Normalisation des données
-            scaler = StandardScaler()
-            X_scaled = scaler.fit_transform(X_df)
-            X_scaled_df = pd.DataFrame(X_scaled, columns=selected_features)
-            
-            # Exécuter le clustering
-            labels, model = run_clustering(algo_name, params, X_scaled_df)
-            
-            # Calculer les métriques
+            df = st.session_state.current_data
+            X_df = df[selected_features].copy()  # Already preprocessed (encoded + scaled if chosen)
+
+            # Run clustering directly on preprocessed data
+            labels, model = run_clustering(algo_name, params, X_df)
+
+            # Use raw preprocessed array for metrics
+            X_scaled = X_df.values
             metrics = calculate_metrics(X_scaled, labels)
-            
+
             # Stocker les résultats
             result = {
                 'algorithm': algo_name,
@@ -305,10 +433,9 @@ if len(selected_features) >= 2:
                 'model': model,
                 'metrics': metrics,
                 'features': selected_features,
-                'X_scaled': X_scaled_df,
-                'X_original': X_df
+                'X_scaled': X_df,          # Now already scaled if chosen
+                'X_original': X_df         # Same as scaled if preprocessed, else raw
             }
-            
             st.session_state.results_history.append(result)
             st.sidebar.success("✅ Clustering terminé!")
 
