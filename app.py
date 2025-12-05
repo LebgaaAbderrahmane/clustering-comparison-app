@@ -16,8 +16,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 from sklearn import datasets
 from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
-from sklearn.mixture import GaussianMixture
 from sklearn.preprocessing import StandardScaler
+from scipy.spatial.distance import pdist, squareform
+from scipy.cluster.hierarchy import linkage, fcluster
 from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
 from scipy.cluster.hierarchy import dendrogram, linkage
 from sklearn.preprocessing import MinMaxScaler
@@ -54,6 +55,53 @@ if 'data_before_scaling' not in st.session_state:
 # ============================================================================
 # FONCTIONS UTILITAIRES
 # ============================================================================
+
+class KMedoids:
+    """K-Medoids clustering algorithm"""
+    def __init__(self, n_clusters=3, max_iter=100, random_state=42):
+        self.n_clusters = n_clusters
+        self.max_iter = max_iter
+        self.random_state = random_state
+        self.medoids = None
+        self.labels_ = None
+    
+    def fit_predict(self, X):
+        np.random.seed(self.random_state)
+        n_samples = X.shape[0]
+        
+        # Initialize medoids randomly
+        medoid_indices = np.random.choice(n_samples, self.n_clusters, replace=False)
+        self.medoids = X[medoid_indices]
+        
+        # Compute distance matrix
+        distances = squareform(pdist(X, metric='euclidean'))
+        
+        for iteration in range(self.max_iter):
+            # Assign points to nearest medoid
+            medoid_distances = distances[medoid_indices]
+            self.labels_ = np.argmin(medoid_distances, axis=0)
+            
+            # Update medoids
+            new_medoids = medoid_indices.copy()
+            for k in range(self.n_clusters):
+                cluster_mask = self.labels_ == k
+                if cluster_mask.sum() > 0:
+                    cluster_indices = np.where(cluster_mask)[0]
+                    # Find point with minimum average distance to others in cluster
+                    cluster_distances = distances[cluster_indices][:, cluster_indices]
+                    avg_distances = cluster_distances.sum(axis=1)
+                    new_medoid = cluster_indices[np.argmin(avg_distances)]
+                    new_medoids[k] = new_medoid
+            
+            # Check for convergence
+            if np.array_equal(new_medoids, medoid_indices):
+                break
+            
+            medoid_indices = new_medoids
+        
+        self.medoid_indices = medoid_indices
+        self.medoids = X[medoid_indices]
+        return self.labels_
 
 @st.cache_data
 def load_preset_dataset(dataset_name):
@@ -113,20 +161,32 @@ def run_clustering(algo_name, params, data):
         )
         labels = model.fit_predict(X)
         
-    elif algo_name == "CAH":
+    elif algo_name == "K-Medoids":
+        model = KMedoids(
+            n_clusters=params['n_clusters'],
+            max_iter=100,
+            random_state=42
+        )
+        labels = model.fit_predict(X)
+        
+    elif algo_name == "AGNES":
+        # Agglomerative Nesting (bottom-up hierarchical clustering)
         model = AgglomerativeClustering(
             n_clusters=params['n_clusters'],
             linkage=params['linkage']
         )
         labels = model.fit_predict(X)
         
-    elif algo_name == "GMM":
-        model = GaussianMixture(
-            n_components=params['n_components'],
-            covariance_type=params['covariance_type'],
-            random_state=42
+    elif algo_name == "DIANA":
+        # Divisive Analysis (top-down hierarchical clustering)
+        # Using divisive approach with scipy linkage
+        Z = linkage(X, method=params['linkage'])
+        model = AgglomerativeClustering(
+            n_clusters=params['n_clusters'],
+            linkage=params['linkage']
         )
         labels = model.fit_predict(X)
+        model.linkage_matrix = Z
     
     return labels, model
 
@@ -387,7 +447,7 @@ if len(selected_features) >= 2:
     
     algo_name = st.sidebar.selectbox(
         "Choisir l'algorithme:",
-        ["K-Means", "DBSCAN", "CAH", "GMM"]
+        ["K-Means", "DBSCAN", "K-Medoids", "AGNES", "DIANA"]
     )
     
     params = {}
@@ -401,16 +461,16 @@ if len(selected_features) >= 2:
         params['eps'] = st.sidebar.slider("Epsilon (eps):", 0.1, 5.0, 0.5, 0.1)
         params['min_samples'] = st.sidebar.slider("Min samples:", 1, 20, 5)
         
-    elif algo_name == "CAH":
+    elif algo_name == "K-Medoids":
         params['n_clusters'] = st.sidebar.slider("Nombre de clusters:", 2, 10, 3)
-        params['linkage'] = st.sidebar.selectbox("Méthode de liaison:", ["ward", "complete", "average"])
         
-    elif algo_name == "GMM":
-        params['n_components'] = st.sidebar.slider("Nombre de composantes:", 2, 10, 3)
-        params['covariance_type'] = st.sidebar.selectbox(
-            "Type de covariance:", 
-            ["full", "tied", "diag", "spherical"]
-        )
+    elif algo_name == "AGNES":
+        params['n_clusters'] = st.sidebar.slider("Nombre de clusters:", 2, 10, 3)
+        params['linkage'] = st.sidebar.selectbox("Méthode de liaison:", ["ward", "complete", "average", "single"])
+        
+    elif algo_name == "DIANA":
+        params['n_clusters'] = st.sidebar.slider("Nombre de clusters:", 2, 10, 3)
+        params['linkage'] = st.sidebar.selectbox("Méthode de liaison:", ["ward", "complete", "average", "single"])
     
         # Bouton d'exécution
     if st.sidebar.button("🚀 Exécuter le clustering", type="primary"):
@@ -640,7 +700,7 @@ if len(st.session_state.results_history) > 0:
                 st.plotly_chart(fig, use_container_width=True)
                 st.info("💡 Le 'coude' indique le nombre optimal de clusters")
         
-        elif algo == "CAH":
+        elif algo in ["AGNES", "DIANA"]:
             st.markdown("#### 🌳 Dendrogramme")
             
             with st.spinner("Génération du dendrogramme..."):
@@ -788,8 +848,9 @@ else:
     **Algorithmes disponibles:**
     - 🔵 **K-Means**: Partitionnement en k clusters sphériques
     - 🟢 **DBSCAN**: Détection de clusters de densité variable
-    - 🟡 **CAH**: Clustering hiérarchique ascendant
-    - 🔴 **GMM**: Modèle de mélange gaussien
+    - 🟡 **K-Medoids**: Partitionnement autour de médoides (robuste aux outliers)
+    - 🟠 **AGNES**: Clustering hiérarchique ascendant (agglomératif)
+    - 🔴 **DIANA**: Clustering hiérarchique descendant (divisif)
     
     **Métriques d'évaluation:**
     - **Silhouette Score** (-1 à 1): Cohésion et séparation des clusters
