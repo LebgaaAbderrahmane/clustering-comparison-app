@@ -15,7 +15,7 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from sklearn import datasets
-from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
+# from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
 from sklearn.preprocessing import StandardScaler
 from scipy.spatial.distance import pdist, squareform
 from scipy.cluster.hierarchy import linkage, fcluster
@@ -102,6 +102,324 @@ class KMedoids:
         self.medoid_indices = medoid_indices
         self.medoids = X[medoid_indices]
         return self.labels_
+
+class KMeans:
+    """K-Means clustering algorithm"""
+    def __init__(self, n_clusters=3, init='k-means++', max_iter=300, random_state=42, n_init=10):
+        self.n_clusters = n_clusters
+        self.init = init
+        self.max_iter = max_iter
+        self.random_state = random_state
+        self.n_init = n_init  # Added for compatibility (can run multiple times and pick best)
+        self.cluster_centers_ = None
+        self.labels_ = None
+        self.inertia_ = None
+    
+    def _initialize_centroids(self, X):
+        np.random.seed(self.random_state)
+        n_samples = X.shape[0]
+        
+        if self.init == 'random':
+            # Random initialization
+            indices = np.random.choice(n_samples, self.n_clusters, replace=False)
+            centroids = X[indices]
+        else:  # k-means++
+            # K-means++ initialization
+            centroids = [X[np.random.randint(n_samples)]]
+            
+            for _ in range(1, self.n_clusters):
+                # Compute distances to nearest centroid
+                distances = np.array([min([np.linalg.norm(x - c)**2 for c in centroids]) for x in X])
+                # Probability proportional to squared distance
+                probabilities = distances / distances.sum()
+                cumulative_probs = probabilities.cumsum()
+                r = np.random.rand()
+                
+                for idx, prob in enumerate(cumulative_probs):
+                    if r < prob:
+                        centroids.append(X[idx])
+                        break
+            
+            centroids = np.array(centroids)
+        
+        return centroids
+    
+    def fit(self, X):
+        # Initialize centroids
+        self.cluster_centers_ = self._initialize_centroids(X)
+        
+        for iteration in range(self.max_iter):
+            # Assign points to nearest centroid
+            distances = np.sqrt(((X - self.cluster_centers_[:, np.newaxis])**2).sum(axis=2))
+            self.labels_ = np.argmin(distances, axis=0)
+            
+            # Update centroids
+            new_centroids = np.array([X[self.labels_ == k].mean(axis=0) 
+                                      for k in range(self.n_clusters)])
+            
+            # Check for convergence
+            if np.allclose(self.cluster_centers_, new_centroids):
+                break
+            
+            self.cluster_centers_ = new_centroids
+        
+        # Calculate inertia (sum of squared distances to nearest centroid)
+        self.inertia_ = sum([np.linalg.norm(X[i] - self.cluster_centers_[self.labels_[i]])**2 
+                            for i in range(len(X))])
+        
+        return self
+    
+    def fit_predict(self, X):
+        self.fit(X)
+        return self.labels_
+    
+class DBSCAN:
+    """DBSCAN clustering algorithm"""
+    def __init__(self, eps=0.5, min_samples=5):
+        self.eps = eps
+        self.min_samples = min_samples
+        self.labels_ = None
+    
+    def _get_neighbors(self, X, point_idx):
+        """Find all neighbors within eps distance"""
+        distances = np.linalg.norm(X - X[point_idx], axis=1)
+        return np.where(distances <= self.eps)[0]
+    
+    def fit(self, X):
+        n_samples = X.shape[0]
+        self.labels_ = np.full(n_samples, -1)  # -1 means unclassified (noise)
+        cluster_id = 0
+        
+        for point_idx in range(n_samples):
+            # Skip if already classified
+            if self.labels_[point_idx] != -1:
+                continue
+            
+            # Find neighbors
+            neighbors = self._get_neighbors(X, point_idx)
+            
+            # Check if core point
+            if len(neighbors) < self.min_samples:
+                # Mark as noise (will be changed if reached by another core point)
+                continue
+            
+            # Start new cluster
+            self.labels_[point_idx] = cluster_id
+            
+            # Expand cluster
+            seed_set = list(neighbors)
+            i = 0
+            while i < len(seed_set):
+                current_point = seed_set[i]
+                
+                # If noise, add to cluster
+                if self.labels_[current_point] == -1:
+                    self.labels_[current_point] = cluster_id
+                
+                # If unclassified, add to cluster and expand
+                if self.labels_[current_point] == -1 or self.labels_[current_point] == cluster_id:
+                    self.labels_[current_point] = cluster_id
+                    
+                    # Find neighbors of current point
+                    current_neighbors = self._get_neighbors(X, current_point)
+                    
+                    # If core point, add its neighbors to seed set
+                    if len(current_neighbors) >= self.min_samples:
+                        for neighbor in current_neighbors:
+                            if neighbor not in seed_set:
+                                seed_set.append(neighbor)
+                
+                i += 1
+            
+            cluster_id += 1
+        
+        return self
+    
+    def fit_predict(self, X):
+        self.fit(X)
+        return self.labels_
+    
+class DIANA:
+    """Divisive Analysis (DIANA) - top-down hierarchical clustering"""
+    def __init__(self, n_clusters=2, linkage='ward'):
+        self.n_clusters = n_clusters
+        self.linkage = linkage
+        self.labels_ = None
+    
+    def _compute_distance_matrix(self, X):
+        """Compute pairwise distance matrix"""
+        return squareform(pdist(X, metric='euclidean'))
+    
+    def _find_splinter(self, cluster_indices, X, dist_matrix):
+        """Find the point that is most dissimilar to split from cluster"""
+        if len(cluster_indices) <= 1:
+            return None
+        
+        # Calculate average distance from each point to all others in cluster
+        avg_distances = []
+        for idx in cluster_indices:
+            other_indices = [i for i in cluster_indices if i != idx]
+            avg_dist = np.mean([dist_matrix[idx, j] for j in other_indices])
+            avg_distances.append((avg_dist, idx))
+        
+        # Return the point with maximum average distance
+        return max(avg_distances)[1]
+    
+    def _split_cluster(self, cluster_indices, X, dist_matrix):
+        """Split a cluster into two sub-clusters"""
+        if len(cluster_indices) <= 1:
+            return [cluster_indices], []
+        
+        # Start with the most dissimilar point
+        splinter_group = [self._find_splinter(cluster_indices, X, dist_matrix)]
+        old_group = [idx for idx in cluster_indices if idx not in splinter_group]
+        
+        # Iteratively move points to splinter group if they're closer to it
+        changed = True
+        while changed and len(old_group) > 0:
+            changed = False
+            for idx in old_group[:]:
+                # Average distance to splinter group
+                dist_to_splinter = np.mean([dist_matrix[idx, j] for j in splinter_group])
+                # Average distance to old group
+                other_old = [i for i in old_group if i != idx]
+                if len(other_old) == 0:
+                    break
+                dist_to_old = np.mean([dist_matrix[idx, j] for j in other_old])
+                
+                # Move to splinter if closer
+                if dist_to_splinter < dist_to_old:
+                    splinter_group.append(idx)
+                    old_group.remove(idx)
+                    changed = True
+        
+        return old_group, splinter_group
+    
+    def fit(self, X):
+        n_samples = X.shape[0]
+        dist_matrix = self._compute_distance_matrix(X)
+        
+        # Start with all points in one cluster
+        clusters = [list(range(n_samples))]
+        
+        # Divisively split until we reach n_clusters
+        while len(clusters) < self.n_clusters:
+            # Find the cluster with maximum diameter to split
+            max_diameter = -1
+            split_idx = 0
+            
+            for i, cluster in enumerate(clusters):
+                if len(cluster) <= 1:
+                    continue
+                # Calculate cluster diameter (max distance between any two points)
+                diameter = max([dist_matrix[p1, p2] for p1 in cluster for p2 in cluster])
+                if diameter > max_diameter:
+                    max_diameter = diameter
+                    split_idx = i
+            
+            # Split the selected cluster
+            cluster_to_split = clusters[split_idx]
+            group1, group2 = self._split_cluster(cluster_to_split, X, dist_matrix)
+            
+            # Replace old cluster with two new clusters
+            clusters[split_idx] = group1
+            if len(group2) > 0:
+                clusters.append(group2)
+        
+        # Assign labels
+        self.labels_ = np.zeros(n_samples, dtype=int)
+        for cluster_id, cluster_indices in enumerate(clusters):
+            for idx in cluster_indices:
+                self.labels_[idx] = cluster_id
+        
+        return self
+    
+    def fit_predict(self, X):
+        self.fit(X)
+        return self.labels_    
+
+
+class AgglomerativeClustering:
+    """Agglomerative (AGNES) hierarchical clustering"""
+    def __init__(self, n_clusters=2, linkage='ward'):
+        self.n_clusters = n_clusters
+        self.linkage = linkage
+        self.labels_ = None
+    
+    def _compute_distance_matrix(self, X):
+        """Compute pairwise distance matrix"""
+        n_samples = X.shape[0]
+        dist_matrix = np.zeros((n_samples, n_samples))
+        for i in range(n_samples):
+            for j in range(i+1, n_samples):
+                dist = np.linalg.norm(X[i] - X[j])
+                dist_matrix[i, j] = dist
+                dist_matrix[j, i] = dist
+        return dist_matrix
+    
+    def _cluster_distance(self, X, cluster1_indices, cluster2_indices, dist_matrix):
+        """Compute distance between two clusters based on linkage method"""
+        if self.linkage == 'single':
+            # Minimum distance
+            distances = [dist_matrix[i, j] for i in cluster1_indices for j in cluster2_indices]
+            return min(distances)
+        
+        elif self.linkage == 'complete':
+            # Maximum distance
+            distances = [dist_matrix[i, j] for i in cluster1_indices for j in cluster2_indices]
+            return max(distances)
+        
+        elif self.linkage == 'average':
+            # Average distance
+            distances = [dist_matrix[i, j] for i in cluster1_indices for j in cluster2_indices]
+            return np.mean(distances)
+        
+        elif self.linkage == 'ward':
+            # Ward linkage (minimize within-cluster variance)
+            cluster1_center = X[cluster1_indices].mean(axis=0)
+            cluster2_center = X[cluster2_indices].mean(axis=0)
+            n1 = len(cluster1_indices)
+            n2 = len(cluster2_indices)
+            return np.sqrt((n1 * n2) / (n1 + n2)) * np.linalg.norm(cluster1_center - cluster2_center)
+    
+    def fit(self, X):
+        n_samples = X.shape[0]
+        
+        # Initialize each point as its own cluster
+        clusters = [[i] for i in range(n_samples)]
+        
+        # Compute distance matrix
+        dist_matrix = self._compute_distance_matrix(X)
+        
+        # Merge clusters until we reach n_clusters
+        while len(clusters) > self.n_clusters:
+            # Find closest pair of clusters
+            min_dist = float('inf')
+            merge_i, merge_j = 0, 1
+            
+            for i in range(len(clusters)):
+                for j in range(i+1, len(clusters)):
+                    dist = self._cluster_distance(X, clusters[i], clusters[j], dist_matrix)
+                    if dist < min_dist:
+                        min_dist = dist
+                        merge_i, merge_j = i, j
+            
+            # Merge the closest clusters
+            clusters[merge_i].extend(clusters[merge_j])
+            clusters.pop(merge_j)
+        
+        # Assign labels
+        self.labels_ = np.zeros(n_samples, dtype=int)
+        for cluster_id, cluster_indices in enumerate(clusters):
+            for idx in cluster_indices:
+                self.labels_[idx] = cluster_id
+        
+        return self
+    
+    def fit_predict(self, X):
+        self.fit(X)
+        return self.labels_
+
 
 @st.cache_data
 def load_preset_dataset(dataset_name):
@@ -270,7 +588,7 @@ if data_source == "Ensembles prédéfinis":
             st.session_state.data_before_scaling = df.copy()
             st.sidebar.success(f"✅ Dataset {dataset_name} chargé ({len(df)} lignes)")
 
-else:
+else:  # Import personnalisé
     uploaded_file = st.sidebar.file_uploader(
         "Uploader un fichier CSV/Excel:",
         type=['csv', 'xlsx', 'xls']
@@ -283,19 +601,20 @@ else:
             else:
                 df = pd.read_excel(uploaded_file)
             
-            # Vérifier les valeurs manquantes
+            # ⬇️ FIX: Always store the data, even with missing values
+            st.session_state.current_data = df
+            st.session_state.data_before_scaling = df.copy()
+            
+            # Check for missing values (but don't block the data)
             has_missing, missing_cols = check_missing_values(df)
             if has_missing:
-                st.sidebar.error("❌ Valeurs manquantes détectées:")
-                st.sidebar.write(missing_cols)
-                df = None
+                st.sidebar.warning(f"⚠️ Valeurs manquantes détectées dans {len(missing_cols)} colonnes")
+                st.sidebar.info("👉 Utilisez le prétraitement pour les gérer")
             else:
-                st.session_state.current_data = df
-                st.session_state.data_before_scaling = df.copy()
                 st.sidebar.success(f"✅ Fichier chargé ({len(df)} lignes)")
                 
         except Exception as e:
-            st.sidebar.error(f"❌ Erreur de chargement: {str(e)}")
+            st.sidebar.error(f"⚠️ Erreur de chargement: {str(e)}")
 
 # ============================================================================
 # SIDEBAR - DATA PREPROCESSING (FIXED FOR SCALING REAPPLICATION)
@@ -314,6 +633,9 @@ if st.session_state.current_data is not None:
             ["Supprimer les lignes", "Remplir par la moyenne", "Remplir par la médiane", "Remplir par 0"]
         )
         if st.sidebar.button("🔧 Appliquer le traitement"):
+            # ⬇️ ADD THIS: Work with a copy of current data
+            df = st.session_state.current_data.copy()
+            
             if missing_action == "Supprimer les lignes":
                 df = df.dropna()
             else:
@@ -334,7 +656,7 @@ if st.session_state.current_data is not None:
                         df[col] = df[col].fillna(fill_val)
 
             st.session_state.current_data = df
-            st.session_state.data_before_scaling = df.copy()  # ← ADD THIS LINE
+            st.session_state.data_before_scaling = df.copy()
             st.session_state.unscaled_data = None
             st.session_state.scaling_applied = False
             st.session_state.data_preprocessed = False
@@ -404,14 +726,18 @@ if st.session_state.current_data is not None:
             st.session_state.scaling_applied = scaling_done
             st.session_state.data_preprocessed = True
             st.sidebar.success("✅ Prétraitement terminé!")
+            # df = df_preprocessed
             st.rerun()
 
 # Afficher aperçu et sélection des colonnes
 if st.session_state.current_data is not None:
-    df = st.session_state.current_data
+    df = st.session_state.current_data.copy()  # ⬅️ Use copy to ensure fresh data
     
     st.sidebar.markdown("---")
     st.sidebar.subheader("📋 Aperçu des données")
+    
+    # ⬇️ ADD: Show data info
+    st.sidebar.caption(f"📊 {len(df)} lignes × {len(df.columns)} colonnes")
     st.sidebar.dataframe(df.head(), height=150)
     
     # Sélection des features numériques
